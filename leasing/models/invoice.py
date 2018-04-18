@@ -1,11 +1,13 @@
 from auditlog.registry import auditlog
 from django.db import models
+from django.db.models import Q
 from django.utils.translation import ugettext_lazy as _
 from enumfields import EnumField
 
-from leasing.enums import InvoiceDeliveryMethod, InvoiceState, InvoiceType
+from leasing.enums import InvoiceDeliveryMethod, InvoiceState, InvoiceType, TenantContactType
 from leasing.models import Contact
 from leasing.models.mixins import TimeStampedSafeDeleteModel
+from leasing.models.rent import PayableRent
 
 
 class ReceivableType(models.Model):
@@ -125,3 +127,40 @@ class BankHoliday(models.Model):
 
 
 auditlog.register(Invoice)
+
+
+def create_invoice_for_month(lease, month):
+    pass
+
+
+def create_invoice(lease, contact, period_start, period_end, **kwargs):
+    all_payable_rents = PayableRent.objects.filter(rent__lease=lease)
+
+    overlapping_payable_rents = all_payable_rents.filter(
+        Q(Q(end_date__isnull=True) | Q(end_date__gte=period_start)) &
+        Q(Q(start_date__isnull=True) | Q(start_date__lte=period_end)))
+
+    rent_count = overlapping_payable_rents.count()
+
+    if not rent_count:
+        print('no payable rent')
+        return
+
+    if rent_count > 1:
+        raise NotImplemented('more than one payable rents (%d)' % rent_count)
+
+    payable_rent = overlapping_payable_rents.first()
+
+    for contact in Contact.objects.filter(lease=lease).filter(tenantcontact__type=TenantContactType.BILLING):
+        print('contact: %s' % contact)
+    return
+
+    new_invoice = Invoice.objects.create(
+        lease=lease,
+        recipient=contact,
+        billing_period_start_date=period_start,
+        billing_period_end_date=period_end,
+        rent_amount=payable_rent.amount,
+        **kwargs)
+
+    return new_invoice

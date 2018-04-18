@@ -1,11 +1,18 @@
+from datetime import datetime
+from decimal import Decimal
+
 from auditlog.registry import auditlog
+from dateutil.relativedelta import relativedelta
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
+from django.db.models import Q
 from django.utils.translation import ugettext_lazy as _
 from enumfields import EnumField
+from math import ceil, floor
 
 from leasing.enums import (
     DueDatesType, IndexType, PeriodType, RentAdjustmentAmountType, RentAdjustmentType, RentCycle, RentType)
+from leasing.models.utils import calculate_index_adjusted_value
 
 from .decision import Decision
 from .mixins import NameModel, TimeStampedSafeDeleteModel
@@ -72,6 +79,82 @@ class Rent(TimeStampedSafeDeleteModel):
     # In Finnish: Loppupvm
     end_date = models.DateField(verbose_name=_("End date"), null=True, blank=True)
 
+    def find_action_points(self):
+        points = set()
+        contract_rents = self.contract_rents.all()
+        rent_adjustments = self.rent_adjustments.all()
+
+        for contract_rent in contract_rents:
+            if contract_rent.start_date:
+                points.add(contract_rent.start_date)
+            if contract_rent.end_date:
+                points.add(contract_rent.end_date)
+
+        for rent_adjustment in rent_adjustments:
+            if rent_adjustment.start_date:
+                points.add(rent_adjustment.start_date)
+            if rent_adjustment.end_date:
+                points.add(rent_adjustment.end_date)
+
+        print('points: %s' % points)
+
+        points = sorted(points)
+
+        print('sorted points %s' % points)
+
+    def get_amount_for_month(self, year, month):
+        period_start = datetime(year, month, 1)
+        period_end = datetime(year, month, 1) + relativedelta(day=31)  # get the last day of the month
+
+        range_filtering = Q(
+            Q(Q(end_date=None) | Q(end_date__gte=period_start)) &
+            Q(Q(start_date=None) | Q(start_date__lte=period_end)))
+
+        contract_rents = self.contract_rents.filter(range_filtering)
+
+        if not contract_rents.count():
+            return None
+
+        intended_uses = RentIntendedUse.objects.filter(contractrent__in=contract_rents).distinct()
+        total_amount = Decimal('0.00')
+
+        for intended_use in intended_uses:
+            contract_rents_by_usage = contract_rents.filter(intended_use=intended_use)
+
+            if contract_rents_by_usage.count() > 1:
+                raise NotImplementedError('More than one contract rents ({}) overlap year {} month {}'.format(
+                    contract_rents_by_usage, year, month)
+                )
+
+            contract_rent = contract_rents_by_usage.first()
+
+            if self.type == RentType.FIXED:
+                rent_amount = contract_rent.get_monthly_base_amount()
+            elif self.type == RentType.INDEX:
+                rent_amount = get_index_adjusted_amount(year, contract_rent.get_monthly_base_amount())
+            else:
+                raise NotImplementedError('Illegal rent type {}'.format(self.type))
+
+            rent_adjustments = self.rent_adjustments.filter(range_filtering, intended_use=intended_use)
+
+            if rent_adjustments.count() > 1:
+                raise NotImplementedError(
+                    'More than one rent adjustments ({}) overlap year {} month {}'.format(rent_adjustments, year, month)
+                )
+
+            rent_adjustment = rent_adjustments.last()
+            if rent_adjustment:
+                rent_amount = rent_adjustment.get_adjusted_amount(rent_amount)
+
+            total_amount += rent_amount
+
+        return total_amount
+
+
+def get_index_adjusted_amount(year, original_rent, index_type=IndexType.TYPE_7):
+    index = Index.objects.get(year=year-1, month=None)
+    return calculate_index_adjusted_value(original_rent, index, index_type)
+
 
 class RentDueDate(TimeStampedSafeDeleteModel):
     """
@@ -129,6 +212,14 @@ class ContractRent(TimeStampedSafeDeleteModel):
 
     # In Finnish: Loppupvm
     end_date = models.DateField(verbose_name=_("End date"), null=True, blank=True)
+
+    def get_monthly_base_amount(self):
+        if self.period == PeriodType.PER_MONTH:
+            return self.base_amount
+        elif self.period == PeriodType.PER_YEAR:
+            return self.base_amount / 12
+        else:
+            raise NotImplementedError('Cannot calculate monthly rent for PeriodType {}'.format(self.period))
 
 
 class IndexAdjustedRent(models.Model):
@@ -188,6 +279,23 @@ class RentAdjustment(TimeStampedSafeDeleteModel):
 
     # In Finnish: Kommentti
     note = models.TextField(verbose_name=_("Note"), null=True, blank=True)
+
+    def get_adjusted_amount(self, rent_amount):
+        if self.amount_type == RentAdjustmentAmountType.PERCENT_PER_YEAR:
+            adjustment = self.full_amount / 100 * rent_amount
+        elif self.amount_type == RentAdjustmentAmountType.AMOUNT_PER_YEAR:
+            adjustment = self.full_amount / 12
+        else:
+            raise NotImplementedError(
+                'Cannot get adjusted rent amount for RentAdjustmentAmountType {}'.format(self.amount_type))
+
+        if self.type == RentAdjustmentType.INCREASE:
+            return rent_amount + adjustment
+        elif self.type == RentAdjustmentType.DISCOUNT:
+            return max(rent_amount - adjustment, 0)
+        else:
+            raise NotImplementedError(
+                'Cannot get adjusted rent amount for RentAdjustmentType {}'.format(self.amount_type))
 
 
 class PayableRent(models.Model):
