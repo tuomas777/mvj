@@ -1,11 +1,18 @@
+from collections import OrderedDict, defaultdict
+from datetime import date, timedelta
+from decimal import Decimal
+
 from auditlog.registry import auditlog
+from dateutil.relativedelta import relativedelta
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
+from django.db.models import Q
 from django.utils.translation import ugettext_lazy as _
 from enumfields import EnumField
 
 from leasing.enums import (
     DueDatesType, IndexType, PeriodType, RentAdjustmentAmountType, RentAdjustmentType, RentCycle, RentType)
+from leasing.models.utils import calculate_index_adjusted_value, convert_monthly_amount_to_period_amount
 
 from .decision import Decision
 from .mixins import NameModel, TimeStampedSafeDeleteModel
@@ -72,6 +79,132 @@ class Rent(TimeStampedSafeDeleteModel):
     # In Finnish: Loppupvm
     end_date = models.DateField(verbose_name=_("End date"), null=True, blank=True)
 
+    def get_amount_for_year(self, year):
+        period_start = date(year, 1, 1)
+        period_end = date(year, 12, 31)
+        return self.get_amount_for_period(period_start, period_end)
+
+    def get_amount_for_month(self, year, month):
+        period_start = date(year, month, 1)
+        period_end = date(year, month, 1) + relativedelta(day=31)
+        return self.get_amount_for_period(period_start, period_end)
+
+    def get_amount_for_period(self, period_start, period_end):
+        if self.type == RentType.INDEX and period_start.year != period_end.year:
+            raise NotImplementedError('Cannot calculate index adjusted rent that is spanning multiple years.')
+
+        range_filtering = Q(
+            Q(Q(end_date=None) | Q(end_date__gte=period_start)) &
+            Q(Q(start_date=None) | Q(start_date__lte=period_end)))
+
+        contract_rents = self.contract_rents.filter(range_filtering)
+        rent_adjustments = self.rent_adjustments.filter(range_filtering)
+
+        intended_uses = RentIntendedUse.objects.filter(contractrent__in=contract_rents).distinct()
+        total = Decimal('0.00')
+
+        for intended_use in intended_uses:
+            contract_rents_by_usage = contract_rents.filter(intended_use=intended_use)
+            rent_adjustments_by_usage = rent_adjustments.filter(intended_use=intended_use)
+
+            intervals = self._get_rent_amount_intervals(
+                (contract_rents_by_usage, rent_adjustments_by_usage), period_start, period_end)
+
+            total += self._get_total_from_rent_amount_intervals(intervals)
+
+        return total
+
+    def _get_total_from_rent_amount_intervals(self, intervals):
+        interval_iter = iter(intervals.items())
+        first_interval_date, first_objects = next(interval_iter)
+        previous_interval_date = first_interval_date
+        current_contract_rent, current_rent_adjustments = self._get_current_objects(first_objects['starting'])
+        last_interval_date = next(reversed(intervals))
+        total = Decimal('0.00')
+
+        for interval_date, interval_objects in interval_iter:
+            if current_contract_rent:
+                current_period = (previous_interval_date, interval_date-timedelta(days=1))
+
+                if self.type == RentType.FIXED:
+                    rent_amount = current_contract_rent.get_amount_for_period(*current_period)
+                elif self.type == RentType.INDEX:
+                    original_rent_amount = current_contract_rent.get_amount_for_period(*current_period)
+                    rent_amount = self.get_index_adjusted_amount(first_interval_date.year, original_rent_amount)
+                else:
+                    raise NotImplementedError('Illegal rent type {}'.format(self.type))
+
+                adjust_amount = 0
+
+                for rent_adjustment in current_rent_adjustments:
+                    adjust_amount += rent_adjustment.get_amount_for_period(rent_amount, *current_period)
+                rent_amount = max(0, rent_amount + adjust_amount)
+
+                total += rent_amount
+
+            if interval_date == last_interval_date:
+                break
+
+            ending_contract_rent, ending_rent_adjustments = self._get_current_objects(interval_objects['ending'])
+            current_rent_adjustments = current_rent_adjustments - ending_rent_adjustments
+
+            if ending_contract_rent:
+                current_contract_rent = None
+
+            starting_contract_rent, starting_rent_adjustments = self._get_current_objects(interval_objects['starting'])
+            current_rent_adjustments = current_rent_adjustments | starting_rent_adjustments
+
+            if starting_contract_rent:
+                current_contract_rent = starting_contract_rent
+
+            previous_interval_date = interval_date
+
+        return total
+
+    @staticmethod
+    def _get_rent_amount_intervals(querysets, period_start, period_end):
+        intervals = defaultdict(lambda: {
+            'starting': set(),
+            'ending': set(),
+        })
+
+        for queryset in querysets:
+            for obj in queryset:
+                if obj.start_date and obj.start_date > period_start:
+                    start_day = obj.start_date
+                else:
+                    start_day = period_start
+
+                if obj.end_date and obj.end_date < period_end:
+                    end_day = obj.end_date + timedelta(days=1)
+                else:
+                    end_day = period_end + timedelta(days=1)
+
+                intervals[start_day]['starting'].add(obj)
+                intervals[end_day]['ending'].add(obj)
+
+        ordered = OrderedDict()
+        for key, value in sorted(intervals.items()):
+            ordered[key] = value
+
+        return ordered
+
+    @staticmethod
+    def _get_current_objects(interval):
+        contract_rent = None
+        adjustments = set()
+        for value in interval:
+            if isinstance(value, ContractRent):
+                contract_rent = value
+            elif isinstance(value, RentAdjustment):
+                adjustments.add(value)
+        return contract_rent, adjustments
+
+    @staticmethod
+    def get_index_adjusted_amount(year, original_rent, index_type=IndexType.TYPE_7):
+        index = Index.objects.get(year=year-1, month=None)
+        return calculate_index_adjusted_value(original_rent, index, index_type)
+
 
 class RentDueDate(TimeStampedSafeDeleteModel):
     """
@@ -129,6 +262,25 @@ class ContractRent(TimeStampedSafeDeleteModel):
 
     # In Finnish: Loppupvm
     end_date = models.DateField(verbose_name=_("End date"), null=True, blank=True)
+
+    def get_monthly_base_amount(self):
+        if self.period == PeriodType.PER_MONTH:
+            return self.base_amount
+        elif self.period == PeriodType.PER_YEAR:
+            return self.base_amount / 12
+        else:
+            raise NotImplementedError('Cannot calculate monthly rent for PeriodType {}'.format(self.period))
+
+    def get_amount_for_period(self, period_start, period_end):
+        if self.start_date:
+            period_start = max(self.start_date, period_start)
+        if self.end_date:
+            period_end = min(self.end_date, period_end)
+
+        monthly_amount = self.get_monthly_base_amount()
+        period_amount = convert_monthly_amount_to_period_amount(monthly_amount, period_start, period_end)
+
+        return period_amount
 
 
 class IndexAdjustedRent(models.Model):
@@ -188,6 +340,28 @@ class RentAdjustment(TimeStampedSafeDeleteModel):
 
     # In Finnish: Kommentti
     note = models.TextField(verbose_name=_("Note"), null=True, blank=True)
+
+    def get_amount_for_period(self, rent_amount, period_start, period_end):
+        if self.start_date:
+            period_start = max(self.start_date, period_start)
+        if self.end_date:
+            period_end = min(self.end_date, period_end)
+
+        if self.amount_type == RentAdjustmentAmountType.PERCENT_PER_YEAR:
+            adjustment = self.full_amount / 100 * rent_amount
+        elif self.amount_type == RentAdjustmentAmountType.AMOUNT_PER_YEAR:
+            adjustment = convert_monthly_amount_to_period_amount(self.full_amount / 12, period_start, period_end)
+        else:
+            raise NotImplementedError(
+                'Cannot get adjust amount for RentAdjustmentAmountType {}'.format(self.amount_type))
+
+        if self.type == RentAdjustmentType.INCREASE:
+            return adjustment
+        elif self.type == RentAdjustmentType.DISCOUNT:
+            return -adjustment
+        else:
+            raise NotImplementedError(
+                'Cannot get adjust amount for RentAdjustmentType {}'.format(self.amount_type))
 
 
 class PayableRent(models.Model):
